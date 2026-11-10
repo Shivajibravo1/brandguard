@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  database:
+    name: Database tests (37 SQL tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run migrations and tests in a throwaway PostgreSQL 17 container
+        run: bash supabase/tests/run_tests.sh
+
+  web:
+    name: Web app lint and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+  scanner:
+    name: Scanner security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m py_compile scanner/app.py
+      - run: pip install bandit==1.7.10
+      - name: Bandit (medium and high findings fail the build)
+        run: bandit -ll scanner/app.py

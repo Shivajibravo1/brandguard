@@ -1,0 +1,55 @@
+# Local demo only: self-hosted N8N for BrandGuard detection workflows, plus
+# the lookalike domain scanner that N8N calls.
+# Start:  docker compose -f docker-compose.n8n.yml up -d --build
+# Open:   http://localhost:5678
+services:
+  scanner:
+    build: ./scanner
+    image: brandguard-scanner:local
+    container_name: brandguard-scanner
+    restart: unless-stopped
+    # Reachable by N8N at http://scanner:8080. Published on this PC only
+    # (127.0.0.1) for manual checks; never exposed to the network.
+    ports:
+      - "127.0.0.1:8090:8080"
+    environment:
+      - SCANNER_TOKEN=${SCANNER_TOKEN}
+      - SCANNER_NAMESERVERS=${SCANNER_NAMESERVERS:-}
+    # Hardening: read-only file system, no Linux capabilities, no privilege
+    # escalation, and resource limits so a runaway scan cannot starve the PC
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 256
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:2.47.3
+    container_name: brandguard-n8n
+    restart: unless-stopped
+    # Published on this PC only (127.0.0.1), not to the local network
+    ports:
+      - "127.0.0.1:5678:5678"
+    security_opt:
+      - no-new-privileges:true
+    env_file: .env
+    environment:
+      # Workflows read Supabase settings from environment variables in .env
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - GENERIC_TIMEZONE=UTC
+      - TZ=UTC
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_PERSONALIZATION_ENABLED=false
+      - N8N_SECURE_COOKIE=false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n:/import:ro
+
+volumes:
+  n8n_data:

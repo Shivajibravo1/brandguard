@@ -1,0 +1,4 @@
+# Normalise line endings so scripts run on Linux (CI, Docker) and Windows alike
+* text=auto eol=lf
+*.png binary
+*.jpg binary

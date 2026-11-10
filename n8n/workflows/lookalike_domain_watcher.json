@@ -1,0 +1,402 @@
+{
+  "id": "bgLookalikeWatch1",
+  "name": "BrandGuard - website monitor (lookalike domains)",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "nodes": [
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000001",
+      "name": "Every day at 06:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000002",
+      "name": "Run now (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000003",
+      "name": "Get active brands and websites",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL_FROM_DOCKER }}/rest/v1/brands?is_active=eq.true&select=id,tenant_id,name,keywords,brand_assets(asset_type,value)",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000004",
+      "name": "Build scan list",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One scan per official website domain, plus one per search term.\n// .bank.in names can only be registered by licensed banks, so lookalikes\n// appear on other endings: scan the matching .in name instead.\n// Search term scans (term + .com) catch names like brand-kyc.in that do not\n// start from the full website name; they also report if someone else owns\n// term.com itself (official domains are always skipped by the database).\nconst out = [];\nfor (const item of $input.all()) {\n  const b = item.json;\n  const websites = (b.brand_assets || []).filter(a => a.asset_type === 'website').map(a => a.value.toLowerCase());\n  const targets = new Map();\n  for (const w of websites) {\n    const d = w.endsWith('.bank.in') ? w.slice(0, -'.bank.in'.length) + '.in' : w;\n    targets.set(d, false);\n  }\n  for (const k of b.keywords || []) {\n    const term = String(k).toLowerCase().replace(/[^a-z0-9-]/g, '');\n    if (term.length >= 4 && !targets.has(term + '.com')) targets.set(term + '.com', true);\n  }\n  for (const [domain, includeOriginal] of targets) {\n    out.push({ json: {\n      brand_id: b.id, tenant_id: b.tenant_id, brand_name: b.name, domain,\n      keywords: b.keywords || [], include_original: includeOriginal\n    } });\n  }\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000011",
+      "name": "One target at a time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000005",
+      "name": "Scan lookalikes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        100
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.SCANNER_URL || 'http://scanner:8080') + '/scan' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SCANNER_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ domain: $json.domain, keywords: $json.keywords, include_original: $json.include_original }) }}",
+        "options": {
+          "timeout": 1800000
+        }
+      }
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000006",
+      "name": "Ingest and score",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL_FROM_DOCKER }}/rest/v1/rpc/ingest_lookalike_domains",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_brand_id: $('One target at a time').first().json.brand_id, p_scan: $json }) }}",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "outputPropertyName": "alerts"
+            }
+          }
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000007",
+      "name": "Build alert digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        -160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Collect alertable lookalike domains from all scans into one email.\nconst minScore = Number($env.ALERT_MIN_SCORE || 60);\nconst incidents = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const list = Array.isArray(j) ? j : (Array.isArray(j.alerts) ? j.alerts : (j.incident_id ? [j] : []));\n  for (const inc of list) {\n    if (Number(inc.risk_score) >= minScore) incidents.push(inc);\n  }\n}\nif (incidents.length === 0) {\n  return [];\n}\nincidents.sort((a, b) => b.risk_score - a.risk_score);\nconst lines = incidents.map(i =>\n  `[${String(i.severity).toUpperCase()} ${i.risk_score}/100] ${i.asset} (${i.change})\\n  ${i.explanation}`\n);\nconst text = [\n  `BrandGuard found ${incidents.length} high-risk lookalike domain(s) of your websites.`,\n  '',\n  ...lines,\n  '',\n  'Open the BrandGuard dashboard to review the evidence and start takedowns.',\n  'Scores are rule-based (v1). Source: BrandGuard website monitor (dnstwist, DNS, WHOIS, home page check).'\n].join('\\n');\nreturn [{ json: {\n  subject: `BrandGuard alert: ${incidents.length} high-risk lookalike domain(s)`,\n  text,\n  incidents\n} }];"
+      }
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000008",
+      "name": "Send alert email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1100,
+        -160
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "bgLocalMailpitSmtp",
+          "name": "Local Mailpit SMTP (demo)"
+        }
+      },
+      "parameters": {
+        "fromEmail": "={{ $env.ALERT_EMAIL_FROM }}",
+        "toEmail": "={{ $env.ALERT_EMAIL_TO }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      }
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000009",
+      "name": "Log alerts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        -160
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL_FROM_DOCKER }}/rest/v1/alerts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build alert digest').first().json.incidents.map(i => ({ tenant_id: i.tenant_id, incident_id: i.incident_id, channel: 'email', recipient: $env.ALERT_EMAIL_TO, status: 'sent', sent_at: new Date().toISOString() }))) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "9a1d0b02-0002-4000-8000-000000000010",
+      "name": "Record scan failure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL_FROM_DOCKER }}/rest/v1/rpc/record_scan_failure",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_brand_id: $('One target at a time').first().json.brand_id, p_source: 'dnstwist', p_error: 'Scan of ' + $('One target at a time').first().json.domain + ' failed: ' + String($json.error?.message || $json.error || 'scanner request failed') }) }}",
+        "options": {}
+      },
+      "alwaysOutputData": true
+    }
+  ],
+  "connections": {
+    "Every day at 06:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "Get active brands and websites",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run now (manual)": {
+      "main": [
+        [
+          {
+            "node": "Get active brands and websites",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get active brands and websites": {
+      "main": [
+        [
+          {
+            "node": "Build scan list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build scan list": {
+      "main": [
+        [
+          {
+            "node": "One target at a time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One target at a time": {
+      "main": [
+        [
+          {
+            "node": "Build alert digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Scan lookalikes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scan lookalikes": {
+      "main": [
+        [
+          {
+            "node": "Ingest and score",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record scan failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ingest and score": {
+      "main": [
+        [
+          {
+            "node": "One target at a time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record scan failure": {
+      "main": [
+        [
+          {
+            "node": "One target at a time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build alert digest": {
+      "main": [
+        [
+          {
+            "node": "Send alert email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send alert email": {
+      "main": [
+        [
+          {
+            "node": "Log alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

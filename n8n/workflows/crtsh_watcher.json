@@ -1,0 +1,203 @@
+{
+  "id": "bgCrtshWatcher01",
+  "name": "BrandGuard - crt.sh lookalike certificate watcher",
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "nodes": [
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000001",
+      "name": "Every 15 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "parameters": {
+        "rule": { "interval": [ { "field": "minutes", "minutesInterval": 15 } ] }
+      }
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000011",
+      "name": "Run now (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 160],
+      "parameters": {}
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000002",
+      "name": "Get active brands",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 0],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL_FROM_DOCKER }}/rest/v1/brands?is_active=eq.true&select=id,tenant_id,name,keywords",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000003",
+      "name": "One item per keyword",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Turn each brand into one item per search keyword.\nconst out = [];\nfor (const item of $input.all()) {\n  const b = item.json;\n  for (const keyword of b.keywords || []) {\n    const k = String(keyword).trim().toLowerCase();\n    if (k.length >= 3) {\n      out.push({ json: { brand_id: b.id, tenant_id: b.tenant_id, brand_name: b.name, keyword: k } });\n    }\n  }\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000004",
+      "name": "Search crt.sh",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 0],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "GET",
+        "url": "=https://crt.sh/?q=%25{{ encodeURIComponent($json.keyword) }}%25&output=json&exclude=expired",
+        "options": {
+          "timeout": 120000,
+          "batching": { "batch": { "batchSize": 1, "batchInterval": 3000 } },
+          "response": { "response": { "responseFormat": "text", "outputPropertyName": "body" } }
+        }
+      }
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000005",
+      "name": "Prepare certificates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, -100],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Parse the crt.sh response and keep only the fields the database needs.\nconst ctx = $('One item per keyword').item.json;\nlet rows;\ntry {\n  rows = JSON.parse($json.body);\n} catch (e) {\n  throw new Error('crt.sh returned a non-JSON response for keyword ' + ctx.keyword);\n}\nif (!Array.isArray(rows)) {\n  throw new Error('crt.sh response is not a list for keyword ' + ctx.keyword);\n}\nconst certs = rows.map(r => ({\n  id: r.id,\n  issuer_name: r.issuer_name,\n  name_value: r.name_value,\n  not_before: r.not_before\n}));\nreturn { json: { p_brand_id: ctx.brand_id, p_certs: certs } };"
+      }
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000006",
+      "name": "Ingest and score",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, -100],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL_FROM_DOCKER }}/rest/v1/rpc/ingest_ct_certificates",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_brand_id: $json.p_brand_id, p_certs: $json.p_certs }) }}",
+        "options": {
+          "timeout": 120000,
+          "response": { "response": { "responseFormat": "json", "outputPropertyName": "new_incidents" } }
+        }
+      }
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000007",
+      "name": "Build alert digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, -100],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Collect new high-risk incidents from all brands into one email.\nconst minScore = Number($env.ALERT_MIN_SCORE || 60);\nconst incidents = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const list = Array.isArray(j) ? j : (Array.isArray(j.new_incidents) ? j.new_incidents : (j.incident_id ? [j] : []));\n  for (const inc of list) {\n    if (Number(inc.risk_score) >= minScore) incidents.push(inc);\n  }\n}\nif (incidents.length === 0) {\n  return [];\n}\nincidents.sort((a, b) => b.risk_score - a.risk_score);\nconst lines = incidents.map(i =>\n  `[${String(i.severity).toUpperCase()} ${i.risk_score}/100] ${i.asset}\\n  ${i.explanation}`\n);\nconst text = [\n  `BrandGuard detected ${incidents.length} new high-risk lookalike certificate(s).`,\n  '',\n  ...lines,\n  '',\n  'Open the BrandGuard dashboard to review and start takedowns.',\n  'Scores are rule-based (v1). Source: crt.sh Certificate Transparency search.'\n].join('\\n');\nreturn [{ json: {\n  subject: `BrandGuard alert: ${incidents.length} new high-risk lookalike(s)`,\n  text,\n  incidents\n} }];"
+      }
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000008",
+      "name": "Send alert email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1540, -100],
+      "credentials": {
+        "smtp": { "id": "bgLocalMailpitSmtp", "name": "Local Mailpit SMTP (demo)" }
+      },
+      "parameters": {
+        "fromEmail": "={{ $env.ALERT_EMAIL_FROM }}",
+        "toEmail": "={{ $env.ALERT_EMAIL_TO }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": { "appendAttribution": false }
+      }
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000009",
+      "name": "Log alerts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1760, -100],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL_FROM_DOCKER }}/rest/v1/alerts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build alert digest').first().json.incidents.map(i => ({ tenant_id: i.tenant_id, incident_id: i.incident_id, channel: 'email', recipient: $env.ALERT_EMAIL_TO, status: 'sent', sent_at: new Date().toISOString() }))) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "8f0c2a01-0001-4000-8000-000000000010",
+      "name": "Record scan failure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 120],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL_FROM_DOCKER }}/rest/v1/rpc/record_scan_failure",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_brand_id: $('One item per keyword').item.json.brand_id, p_source: 'crt.sh', p_error: String($json.error?.message || $json.error || 'crt.sh request failed') }) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Every 15 minutes": { "main": [[ { "node": "Get active brands", "type": "main", "index": 0 } ]] },
+    "Run now (manual)": { "main": [[ { "node": "Get active brands", "type": "main", "index": 0 } ]] },
+    "Get active brands": { "main": [[ { "node": "One item per keyword", "type": "main", "index": 0 } ]] },
+    "One item per keyword": { "main": [[ { "node": "Search crt.sh", "type": "main", "index": 0 } ]] },
+    "Search crt.sh": {
+      "main": [
+        [ { "node": "Prepare certificates", "type": "main", "index": 0 } ],
+        [ { "node": "Record scan failure", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Prepare certificates": { "main": [[ { "node": "Ingest and score", "type": "main", "index": 0 } ]] },
+    "Ingest and score": { "main": [[ { "node": "Build alert digest", "type": "main", "index": 0 } ]] },
+    "Build alert digest": { "main": [[ { "node": "Send alert email", "type": "main", "index": 0 } ]] },
+    "Send alert email": { "main": [[ { "node": "Log alerts", "type": "main", "index": 0 } ]] }
+  },
+  "pinData": {}
+}
